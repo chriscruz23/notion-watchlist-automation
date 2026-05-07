@@ -1,5 +1,5 @@
+from .IMDB_Handler import TMDB_API
 from .NotionHandler import NotionHandler
-from .TMDB_API import TMDB_API
 from .TMDBHandler import TMDBHandler
 
-__all__ = ["NotionHandler", "TMDBHandler", "TMDB_API"]
+__all__ = ["NotionHandler", "TMDBHandler", "IMDB_Handler"]

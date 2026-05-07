@@ -1,7 +1,10 @@
+import json
 import logging
-from typing import Any, Dict, List
+from typing import List
 
-import TMDB_API
+import requests
+
+# import TMDB_API
 import tmdbsimple
 from tmdbsimple import TV, Movies, Search
 
@@ -9,6 +12,7 @@ from tmdbsimple import TV, Movies, Search
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),  # Logs to console
         logging.FileHandler("logs/notion.log"),  # Logs to a file
@@ -21,18 +25,27 @@ logger = logging.getLogger(__name__)
 
 class TMDBHandler:
     def __init__(self, api_key: str | None) -> None:
+        """
+        Initialize the TMDBHandler with the given API key.
+
+        :param api_key: The API key to use for the TMDb API.
+        :raises ValueError: If the API key is invalid.
+        """
         tmdbsimple.API_KEY = api_key
 
         try:
-            # Attempt a test search to verify the API key is valid
             test_search = Search()
-            test_search.multi(query="test")
-            logger.info("TMDBHandler initialized successfully with API key.")
-        except Exception as e:
-            logger.critical("Failed to set API key for TMDBHandler", exc_info=True)
-            raise ValueError("Invalid API key for TMDBHandler.") from e
+            test_search.multi(query=19995)
+            logger.info("TMDBHandler initialized successfully.")
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Failed to connect to TMDb API: {e}")
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Invalid API key provided for TMDBHandler: {api_key}")
+            raise ValueError(
+                f"Invalid API key provided for TMDBHandler: {api_key}"
+            ) from e
 
-    def search_media(self, title: str):
+    def search_media(self, title: str | List[str]):
         """
         Search TMDb for a given title, which could be a movie or TV show.
         Returns a list of search results.
@@ -46,6 +59,11 @@ class TMDBHandler:
             else:
                 logger.info(f"Found {len(results)} result(s) for title: '{title}'")
             return results
+        except requests.exceptions.HTTPError as e:
+            logger.error(
+                f"HTTP error searching for title '{title}': {e}", exc_info=True
+            )
+            raise
         except Exception as e:
             logger.error(f"Error searching for title '{title}': {e}", exc_info=True)
             raise
@@ -72,85 +90,114 @@ class TMDBHandler:
             logger.info(f"Fetched details for {media_type} with ID {media_id}")
             return raw_data
 
-        except ValueError as e:
+        except ValueError:
             logger.error(f"Error with media type: {media_type}", exc_info=True)
-        except AttributeError as e:
+        except AttributeError:
             logger.error(f"Error with tmdb result: {tmdb_result}", exc_info=True)
             raise
-        except Exception as e:
+        except Exception:
             logger.error(f"Error fetching info for media ID {media_id}", exc_info=True)
             raise
+
+    @staticmethod
+    def _get_watch_providers(data, country_code="US"):
+        providers = (
+            data.get("watch/providers", {}).get("results", {}).get(country_code, {})
+        )
+
+        streaming = []
+        watch_free = []
+
+        # Extract provider names from 'flatrate' and 'buy' if they exist
+        if "flatrate" in providers:
+            streaming = [
+                {"name": item["provider_name"]} for item in providers["flatrate"]
+            ]
+
+        if "free" in providers:
+            watch_free = [{"name": item["provider_name"]} for item in providers["free"]]
+
+        return {"streaming": streaming, "watch_free": watch_free}
 
     def clean_media_data(self, tmdb_data, media_type):
         # Extract and format desired TMDb fields
 
-        cleaned_data = {}
         if media_type == "movie":
-
-            # US title
-            tmdb_data["title"] = tmdb_data.pop("title", None)
-
             # Media type
             tmdb_data["type"] = media_type.capitalize()
-
-            # Tagline
-            tmdb_data["tagline"] = tmdb_data.pop("tagline", None)
 
             # TMDB rating
             if tmdb_data.get("vote_average"):
                 tmdb_data["tmdb_rating"] = round(tmdb_data.pop("vote_average"), 1)
-            else:
-                tmdb_data["tmdb_rating"] = None
 
-            # Directors & producers
-            for member in tmdb_data["credits"]["crew"]:
-                if member["job"] == "Director":
-                    tmdb_data.setdefault("directors", []).append(member["name"])
-                elif member["job"] == "Producer":
-                    tmdb_data.setdefault("producers", []).append(member["name"])
+            # Directors, producers, and main actors
+            for key in tmdb_data["credits"]:
+                if key == "crew":  # Directors and producers are here
+                    for member in tmdb_data["credits"][key]:
+                        if member["job"] == "Director":
+                            tmdb_data.setdefault("directors", []).append(member["name"])
+                        elif member["job"] == "Producer":
+                            tmdb_data.setdefault("producers", []).append(member["name"])
+                elif key == "cast":  # Actors are here
+                    for member in tmdb_data["credits"][key]:
+                        if (
+                            member["known_for_department"] == "Acting"
+                            and "(uncredited)" not in member["character"]
+                        ):  # Find only well-known actors
+                            tmdb_data.setdefault("cast", []).append(
+                                {
+                                    "name": member["name"],
+                                    "popularity": member["popularity"],
+                                }
+                            )
 
             tmdb_data["directors"] = ", ".join(tmdb_data.get("directors"))
             tmdb_data["producers"] = ", ".join(tmdb_data.get("producers"))
+            # Sort actors from most popular to least
+            tmdb_data["cast"] = [
+                d["name"]
+                for d in sorted(
+                    tmdb_data["cast"], key=lambda x: x["popularity"], reverse=True
+                )
+            ]
+            tmdb_data["cast"] = ", ".join(tmdb_data.get("cast")[:15])
 
             # Genres
             tmdb_data["genres"] = [
                 {"name": genre["name"]} for genre in tmdb_data.get("genres", [])
             ]
 
-            # Runtime
-            tmdb_data["runtime"] = tmdb_data.pop("runtime", None)
+            # # Streaming providers
+            # for provider in (
+            #     tmdb_data.get("watch/providers", {})
+            #     .get("results", {})
+            #     .get("US", {})
+            #     .get("flatrate", [])
+            # ):
+            #     if provider:
+            #         tmdb_data["streaming"] = [
+            #             {"name": provider["provider_name"]}
+            #             for provider in tmdb_data.get("watch/providers", {})
+            #             .get("results", {})
+            #             .get("US", {})
+            #             .get("flatrate", [])
+            #         ]
 
-            # Streaming providers
-            for provider in (
-                tmdb_data.get("watch/providers", {})
-                .get("results", {})
-                .get("US", {})
-                .get("flatrate", [])
-            ):
-                if provider:
-                    tmdb_data["streaming"] = [
-                        {"name": provider["provider_name"]}
-                        for provider in tmdb_data.get("watch/providers", {})
-                        .get("results", {})
-                        .get("US", {})
-                        .get("flatrate", [])
-                    ]
-
-            # Watch free
-            for provider in (
-                tmdb_data.get("watch/providers", {})
-                .get("results", {})
-                .get("US", {})
-                .get("free", [])
-            ):
-                if provider:
-                    tmdb_data["watch_free"] = [
-                        {"name": provider["provider_name"]}
-                        for provider in tmdb_data.get("watch/providers", {})
-                        .get("results", {})
-                        .get("US", {})
-                        .get("free", [])
-                    ]
+            # # Watch free
+            # for provider in (
+            #     tmdb_data.get("watch/providers", {})
+            #     .get("results", {})
+            #     .get("US", {})
+            #     .get("free", [])
+            # ):
+            #     if provider:
+            #         tmdb_data["watch_free"] = [
+            #             {"name": provider["provider_name"]}
+            #             for provider in tmdb_data.get("watch/providers", {})
+            #             .get("results", {})
+            #             .get("US", {})
+            #             .get("free", [])
+            #         ]
 
             # Official trailer
             # TODO Prioritize official trailers
@@ -178,45 +225,21 @@ class TMDBHandler:
                 else None
             )
 
-            # Synopsis
-            tmdb_data["synopsis"] = tmdb_data.pop("overview", None)
-
-            # Release Date
-            tmdb_data["release_date"] = tmdb_data.pop("release_date", None)
-
-            # Cast members
-            for member in tmdb_data["credits"]["cast"]:
-                if (
-                    member["known_for_department"] == "Acting"
-                    and "(uncredited)" not in member["character"]
-                ):
-                    tmdb_data.setdefault("cast_list", []).append(member["name"])
-
-            tmdb_data["cast"] = ", ".join(tmdb_data.pop("cast_list", [])[:10])
-
             # Country of origin
-            # FIXME using the wrong data, should use "origin_country"
-            tmdb_data["country_of_origin"] = (
-                tmdb_data.get("production_countries")[0]["name"]
-                if tmdb_data.get("production_countries")
+            # TODO change origin country to full country name
+            tmdb_data["origin_country"] = (
+                tmdb_data.get("origin_country")[0]
+                if tmdb_data.get("origin_country")
                 else None
             )
 
             # Content rating
-            for result in tmdb_data["release_dates"]["results"]:
-                if result["iso_3166_1"] == "US":
-                    for date in result["release_dates"]:
-                        if date["certification"]:
-                            tmdb_data["content_rating"] = date["certification"]
-                        else:
-                            tmdb_data["content_rating"] = None
-
-            # Poster path
-            tmdb_data["poster_path"] = (
-                f'https://image.tmdb.org/t/p/original{tmdb_data["poster_path"]}'
-                if tmdb_data.get("poster_path")
-                else None
-            )
+            if tmdb_data.get("release_dates"):
+                for result in tmdb_data["release_dates"]["results"]:
+                    if result["iso_3166_1"] == "US":
+                        for date in result["release_dates"]:
+                            if date["type"] == 1:
+                                tmdb_data["content_rating"] = date["certification"]
 
             # # Episode count
             # tmdb_data['episodes'] = tmdb_data.pop('number_of_episodes', None)
@@ -240,7 +263,7 @@ class TMDBHandler:
             # "Next Air Date": {"date": {"start": data.get("next_air_date")}},
 
             # Production status
-            tmdb_data["status"] = tmdb_data.pop("status", None)
+            # tmdb_data["status"] = tmdb_data.pop("status", None)
 
             # Original language
             # FIXME use tmdb's internal languages instead
@@ -253,41 +276,50 @@ class TMDBHandler:
                 else None
             )
 
-            # Backdrop path
-            tmdb_data["backdrop_path"] = (
-                f'https://image.tmdb.org/t/p/original{tmdb_data["backdrop_path"]}'
-            )
+            # Backdrop and poster paths
+            base_url = "https://image.tmdb.org/t/p/original"
+            if tmdb_data.get("poster_path"):
+                tmdb_data["poster_path"] = base_url + tmdb_data["poster_path"]
+            if tmdb_data.get("backdrop_path"):
+                tmdb_data["backdrop_path"] = base_url + tmdb_data["backdrop_path"]
 
         elif media_type == "tv":
             pass
 
-        for key in list(tmdb_data.keys()):
-            if tmdb_data[key] is None or key not in [
-                "title",
-                "type",
-                "tagline",
-                "tmdb_rating",
-                "directors",
-                "producers",
-                "genres",
-                "runtime",
-                "streaming",
-                "watch_free",
-                "trailer_url",
-                "imdb_url",
-                "synopsis",
-                "release_date",
-                "cast",
-                "country_of_origin",
-                "content_rating",
-                "poster_path",
-                "status",
-                "original_language",
-                "original_title",
-                "backdrop_path",
-            ]:
-                del tmdb_data[key]
+        return self._filter_tmdb_data(tmdb_data, keep_nulls=True)
 
+    @staticmethod
+    def _filter_tmdb_data(tmdb_data, keep_nulls=False):
+        # 22 keys
+        allowed_keys = [
+            "title",
+            "type",
+            "tagline",
+            "tmdb_rating",
+            "directors",
+            "producers",
+            "genres",
+            "runtime",
+            "streaming",
+            "watch_free",
+            "trailer_url",
+            "imdb_url",
+            "overview",
+            "release_date",
+            "cast",
+            "origin_country",
+            "content_rating",
+            "poster_path",
+            "status",
+            "original_language",
+            "original_title",
+            "backdrop_path",
+        ]
+        for key in list(tmdb_data.keys()):
+            if not keep_nulls and tmdb_data[key] is None:
+                del tmdb_data[key]
+            elif key not in allowed_keys:
+                del tmdb_data[key]
         return tmdb_data
 
     def get_cleaned_media_data(self, title: str):
@@ -310,3 +342,15 @@ class TMDBHandler:
         print(search_results)
 
         # return cleaned_data
+
+    def test_clean_media_data(self):
+        with open("scratch/the_dark_knight.json", "r") as f:
+            tmdb_data = json.load(f)
+
+        # Assuming you want to test with "movie" media type
+        media_type = "movie"
+
+        cleaned_data = self.clean_media_data(tmdb_data, media_type)
+
+        # You can add assertions or print statements here to verify the output
+        return cleaned_data

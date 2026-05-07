@@ -6,6 +6,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+# TODO use configuration -> countries / Languages to convert origin_country and original_language
 class TMDB_API:
     BASE_URL = "https://api.themoviedb.org/3/"
 
